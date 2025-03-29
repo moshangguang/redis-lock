@@ -117,7 +117,7 @@ func (locker *RLocker) lock(ctx context.Context, tries int) (err error) {
 		for {
 			select {
 			case <-ticker.C:
-				if err := locker.redisClient.Expire(ctx, locker.key, maxKeepalive).Err(); err != nil {
+				if err := locker.redisClient.Expire(context.Background(), locker.key, maxKeepalive).Err(); err != nil {
 					locker.errHandler(ErrorOption{
 						Title: "【Redis分布式锁】锁续时出错",
 						Error: err,
