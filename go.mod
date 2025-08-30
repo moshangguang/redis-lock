@@ -2,10 +2,7 @@ module github.com/moshangguang/redis-lock
 
 go 1.17
 
-require (
-	github.com/go-redis/redis/v8 v8.11.5
-	github.com/google/uuid v1.6.0
-)
+require github.com/go-redis/redis/v8 v8.11.5
 
 require (
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect

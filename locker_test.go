@@ -2,6 +2,7 @@ package redislock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -135,7 +136,7 @@ func TestRLocker_Lock2(t *testing.T) {
 		ctx, cancelFunc := context.WithTimeout(context.Background(), maxTimeout)
 		defer cancelFunc()
 		err := locker2.Lock(ctx, miniTimeout)
-		if err == LockerTimeout {
+		if errors.Is(err, LockerTimeout) {
 			delta := time.Now().Sub(start)
 			if delta >= miniTimeout && delta < miniTimeout+time.Second {
 				t.Logf("次协程抢锁出现预期抢锁超时,耗时：%fs", delta.Seconds())
@@ -159,7 +160,7 @@ func TestRLocker_Lock2(t *testing.T) {
 		ctx, cancelFunc := context.WithTimeout(context.Background(), miniTimeout)
 		defer cancelFunc()
 		err := locker3.Lock(ctx, maxTimeout)
-		if err == LockerTimeout {
+		if errors.Is(err, LockerTimeout) {
 			delta := time.Now().Sub(start)
 			if delta >= miniTimeout && delta < miniTimeout+time.Second {
 				t.Logf("次协程抢锁出现预期抢锁超时,耗时：%fs", delta.Seconds())

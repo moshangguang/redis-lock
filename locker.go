@@ -4,58 +4,58 @@ import (
 	"context"
 	"math"
 	"math/rand"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 )
 
 type Locker interface {
-	Lock(ctx context.Context, timeout ...time.Duration) (err error) //如果传timeout，则在指定timeout时间内如果没抢到锁则返回抢锁失败，否则使用默认timeout
-	TryLock(ctx context.Context) (bool, error)                      //尝试抢锁，无阻塞
-	Unlock(ctx context.Context) error                               //释放锁，由外部处理错误
+	Lock(ctx context.Context, timeout ...time.Duration) error //如果传timeout，则在指定timeout时间内如果没抢到锁则返回抢锁失败，否则使用默认timeout
+	TryLock(ctx context.Context) (bool, error)                //尝试抢锁，无阻塞
+	Unlock(ctx context.Context) error                         //释放锁，由外部处理错误
+	Expire(expire time.Duration) Locker
 }
 type RLocker struct {
 	key         string
-	owner       string
+	value       string
+	expire      time.Duration
 	timeout     time.Duration
-	done        chan struct{}
-	state       *uint32
 	redisClient *redis.Client
+	cancelFunc  context.CancelFunc
 	errHandler  func(option ErrorOption)
 }
 
-func (locker *RLocker) Lock(ctx context.Context, timeout ...time.Duration) (err error) {
-	_, ok := ctx.Deadline()
-	if ok && len(timeout) == 0 { //如果ctx有过期时间，且没有指定timeout，则使用ctx的过期时间
-		return locker.lock(ctx, math.MaxInt)
-	}
-	//如果
-	t := locker.timeout
-	if len(timeout) != 0 && timeout[0] > minTimeout {
+func (l *RLocker) Expire(expire time.Duration) Locker {
+	l.expire = expire
+	return l
+}
+
+var _ Locker = new(RLocker)
+
+func (l *RLocker) Lock(ctx context.Context, timeout ...time.Duration) error {
+	t := l.timeout
+	if len(timeout) > 0 {
 		t = timeout[0]
 	}
-	//如果ctx有过期时间，或有指定timeout，则再次创建带timeout的ctx
-	ctx, cancelFunc := context.WithTimeout(ctx, t)
-	defer cancelFunc()
-	return locker.lock(ctx, math.MaxInt)
+	acquire, err := l.acquire(ctx, t, math.MaxInt)
+	if err != nil {
+		return err
+	}
+	if acquire {
+		return nil
+	}
+	return LockerTimeout
 }
 
-func (locker *RLocker) TryLock(ctx context.Context) (bool, error) {
-	err := locker.lock(ctx, 1)
-	return err == nil, err
+func (l *RLocker) TryLock(ctx context.Context) (bool, error) {
+	return l.acquire(ctx, 0, 1)
 }
 
-func (locker *RLocker) Unlock(ctx context.Context) error {
-	if atomic.LoadUint32(locker.state) != stateLockSuccess {
-		return LockerNonLock
+func (l *RLocker) Unlock(ctx context.Context) error {
+	if l.cancelFunc != nil {
+		l.cancelFunc()
 	}
-	if !atomic.CompareAndSwapUint32(locker.state, stateLockSuccess, stateLockNon) {
-		return LockerNonLock
-	}
-	locker.done <- struct{}{}
-	eval := locker.redisClient.Eval(ctx, deleteScript, []string{locker.key}, locker.owner)
-	res, err := eval.Int()
+	res, err := l.redisClient.Eval(ctx, delScript, []string{l.key}, l.value).Int()
 	if err != nil {
 		return err
 	}
@@ -65,11 +65,12 @@ func (locker *RLocker) Unlock(ctx context.Context) error {
 	return UnlockFail
 }
 
-func (locker *RLocker) lock(ctx context.Context, tries int) (err error) {
-	if ctx == nil {
-		ctx = context.Background()
+func (l *RLocker) acquire(ctx context.Context, timeout time.Duration, tries int) (bool, error) {
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 	}
-	isAcquire := false
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -83,54 +84,66 @@ func (locker *RLocker) lock(ctx context.Context, tries int) (err error) {
 			}
 			select {
 			case <-ctx.Done():
-				return LockerTimeout
+				return false, nil
 			case <-timer.C:
 				timer.Reset(getDelayDuration())
 			}
 		}
-		isAcquire, err = locker.redisClient.SetNX(ctx, locker.key, locker.owner, maxKeepalive).Result()
+
+		ok, err := l.tryAcquire(ctx)
 		if err != nil {
-			return err
+			return false, err
 		}
-		if isAcquire {
-			break
+		if ok {
+			return true, nil
 		}
 	}
-	if !isAcquire {
-		return LockerTimeout
+	return false, nil
+}
+
+func (l *RLocker) tryAcquire(ctx context.Context) (bool, error) {
+	ok, err := l.redisClient.SetNX(ctx, l.key, l.value, l.expire).Result()
+	if err != nil || !ok {
+		return false, err
 	}
+	l.startAutoRenew()
+	return true, nil
+}
+
+func (l *RLocker) startAutoRenew() {
+	ctx, cancel := context.WithCancel(context.Background())
+	l.cancelFunc = cancel
+
 	go func() {
 		defer func() {
-			r := recover()
-			if r == nil {
+			v := recover()
+			if v == nil {
 				return
 			}
-			locker.errHandler(ErrorOption{
-				Title: "【Redis分布式锁】锁续时出现异常",
-				Panic: r,
-				Key:   locker.key,
+			l.errHandler(ErrorOption{
+				Title: "Redis分布式锁续时抛出异常",
+				Panic: v,
+				Key:   l.key,
 			})
 		}()
-		ticker := time.NewTicker(minKeepalive)
+		ticker := time.NewTicker(l.expire / 2)
 		defer ticker.Stop()
-	Loop:
+
 		for {
 			select {
 			case <-ticker.C:
-				if err := locker.redisClient.Expire(context.Background(), locker.key, maxKeepalive).Err(); err != nil {
-					locker.errHandler(ErrorOption{
-						Title: "【Redis分布式锁】锁续时出错",
+				if err := l.redisClient.Expire(ctx, l.key, l.expire).Err(); err != nil {
+					l.errHandler(ErrorOption{
+						Title: "Redis分布式锁续时出错",
 						Error: err,
-						Key:   locker.key,
+						Key:   l.key,
 					})
 				}
-			case <-locker.done:
-				break Loop
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
-	atomic.StoreUint32(locker.state, stateLockSuccess)
-	return
 }
 
 func getDelayDuration() time.Duration {

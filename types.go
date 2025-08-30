@@ -29,6 +29,12 @@ func WithLockerTimeout(timeout time.Duration) AllocatorOption {
 		allocator.timeout = timeout
 	}
 }
+
+func WithLockerExpire(expire time.Duration) AllocatorOption {
+	return func(allocator *Allocator) {
+		allocator.expire = expire
+	}
+}
 func WithErrHandler(errHandler func(option ErrorOption)) AllocatorOption {
 	if errHandler == nil {
 		panic("err handler is nil")
@@ -38,7 +44,7 @@ func WithErrHandler(errHandler func(option ErrorOption)) AllocatorOption {
 	}
 }
 
-var deleteScript = `
+var delScript = `
 	if redis.call("GET", KEYS[1]) == ARGV[1] then
 		return redis.call("DEL", KEYS[1])
 	else

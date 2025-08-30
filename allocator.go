@@ -2,16 +2,18 @@ package redislock
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
 )
 
 type Allocator struct {
-	timeout     time.Duration
-	errHandler  func(option ErrorOption)
-	redisClient *redis.Client
+	timeout    time.Duration
+	expire     time.Duration
+	errHandler func(option ErrorOption)
+	client     *redis.Client
 }
 
 func NewAllocator(redisClient *redis.Client, options ...AllocatorOption) *Allocator {
@@ -23,7 +25,25 @@ func NewAllocator(redisClient *redis.Client, options ...AllocatorOption) *Alloca
 		panic(err)
 	}
 	allocator := &Allocator{
-		redisClient: redisClient,
+		timeout: defaultTimeout,
+		expire:  defaultExpire,
+		errHandler: func(option ErrorOption) {
+			list := make([]interface{}, 0)
+			if len(option.Title) != 0 {
+				list = append(list, option.Title)
+			}
+			if len(option.Key) != 0 {
+				list = append(list, fmt.Sprintf("key:%s", option.Key))
+			}
+			if option.Error != nil {
+				list = append(list, fmt.Sprintf("err:%s", option.Error.Error()))
+			}
+			if option.Panic != nil {
+				list = append(list, fmt.Sprintf("panic:%v", option.Panic))
+			}
+			log.Println(list...)
+		},
+		client: redisClient,
 	}
 	if len(options) != 0 {
 		for _, opt := range options {
@@ -32,29 +52,20 @@ func NewAllocator(redisClient *redis.Client, options ...AllocatorOption) *Alloca
 			}
 		}
 	}
-	if allocator.timeout == 0 {
-		allocator.timeout = defaultTimeout
-	}
-	if allocator.timeout < minTimeout {
-		allocator.timeout = minTimeout
-	}
-
-	if allocator.errHandler == nil {
-		allocator.errHandler = func(option ErrorOption) {
-		}
-	}
 
 	return allocator
 }
 
 func (allocator *Allocator) NewLocker(key string) Locker {
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
 	locker := &RLocker{
 		key:         key,
-		owner:       uuid.New().String(),
+		value:       fmt.Sprintf("%d", time.Now().UnixNano()),
 		timeout:     allocator.timeout,
-		done:        make(chan struct{}),
-		state:       new(uint32),
-		redisClient: allocator.redisClient,
+		expire:      allocator.expire,
+		redisClient: allocator.client,
+		cancelFunc:  nil,
 		errHandler:  allocator.errHandler,
 	}
 	return locker
